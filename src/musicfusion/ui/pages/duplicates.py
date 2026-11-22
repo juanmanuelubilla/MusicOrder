@@ -29,6 +29,7 @@ class DuplicatesPage(QWidget):
         self.context = context
         self.db = context.db
         self.jobs = JobProgress(self, context)
+        self.last_analyzed_paths: list[Path] = []
 
         layout = QVBoxLayout(self)
         layout.setSpacing(10)
@@ -83,6 +84,10 @@ class DuplicatesPage(QWidget):
         self._run(paths=[Path(folder_a), Path(folder_b)])
 
     def _run(self, paths: list[Path] | None = None) -> None:
+        if paths:
+            self.last_analyzed_paths = [Path(p).resolve() for p in paths]
+        else:
+            self.last_analyzed_paths = [Path(lib.path).resolve() for lib in self.context.settings.libraries()]
         self.progress.start("Buscando duplicados…")
         self.jobs.run_duplicates(on_progress=self.progress.record_progress, paths=paths)
 
@@ -124,9 +129,46 @@ class DuplicatesPage(QWidget):
     def set_navigator(self, navigator: object) -> None:
         self.navigator = navigator
 
+    def _get_active_sources(self) -> list[Path]:
+        """Collect source directories from current analysis, settings or table paths."""
+        if hasattr(self, "last_analyzed_paths") and self.last_analyzed_paths:
+            valid = [p for p in self.last_analyzed_paths if p.exists()]
+            if valid:
+                return valid
+
+        # Try configured libraries in settings
+        libs = [Path(l.path).resolve() for l in self.context.settings.libraries() if Path(l.path).exists()]
+        if libs:
+            return libs
+
+        # Infer common root folders from tracks in the duplicates table
+        inferred: set[Path] = set()
+        with self.context.db.session_scope() as session:
+            tracks = session.scalars(select(Track).limit(100)).all()
+            for t in tracks:
+                if t.path:
+                    p = Path(t.path).resolve()
+                    if p.exists() and len(p.parents) >= 2:
+                        inferred.add(p.parents[-2])
+        return list(inferred)[:5]
+
     def _go_fusion(self) -> None:
-        if hasattr(self, "navigator") and self.navigator is not None:
+        if not hasattr(self, "navigator") or self.navigator is None:
+            return
+
+        sources = self._get_active_sources()
+        if not sources:
             self.navigator("Fusión")
+            return
+
+        dest = QFileDialog.getExistingDirectory(
+            self,
+            "Seleccionar carpeta de DESTINO único (donde consolidar la música sin duplicados)",
+        )
+        if not dest:
+            return
+
+        self.navigator("Fusión", tuple(sources), destination=dest, auto_run_prompt=True)
 
     def _export(self) -> None:
         target, _ = QFileDialog.getSaveFileName(

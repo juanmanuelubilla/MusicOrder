@@ -194,13 +194,18 @@ class MainWindow(QMainWindow):
         except KeyError:
             return
         self.sidebar.setCurrentRow(index)
-        if name == "Fusión" and len(payload) >= 2:
+        if name == "Fusión":
             fusion_page = cast(FusionPage, self.pages[index])
-            origin_a, origin_b = payload[0], payload[1]
-            if isinstance(origin_a, (str, Path)) and isinstance(origin_b, (str, Path)):
-                fusion_page.preset_libraries(Path(origin_a), Path(origin_b))
-                if kwargs.get("auto_plan"):
-                    fusion_page.auto_plan_from_comparison()
+            if payload:
+                sources = [Path(p) for p in payload if p and isinstance(p, (str, Path))]
+                if sources:
+                    fusion_page.preset_sources(sources)
+            if "destination" in kwargs and kwargs["destination"]:
+                fusion_page.preset_destination(Path(kwargs["destination"]))
+            if kwargs.get("auto_run_prompt"):
+                fusion_page.prompt_start_fusion()
+            elif kwargs.get("auto_plan"):
+                fusion_page.auto_plan_from_comparison()
 
     def _on_page_changed(self, index: int) -> None:
         """Keep read-only pages fresh with the data already stored in the DB."""

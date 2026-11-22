@@ -562,16 +562,49 @@ class FusionPage(QWidget):
             self.log(f"📊 Informe CSV guardado en: {filename}")
             QMessageBox.information(self, "Exportación exitosa", f"Informe CSV guardado en:\n{filename}")
 
-    def preset_libraries(self, lib_a: Path, lib_b: Path) -> None:
-        """Integration helper when navigating from the Compare page."""
+    def preset_sources(self, sources: list[Path]) -> None:
+        """Set source folders programmatically from previous analysis."""
         self._clear_sources()
-        for lib in (lib_a, lib_b):
-            p = lib.resolve()
+        for src in sources:
+            p = src.resolve()
             if p not in self.sources:
                 self.sources.append(p)
                 self.sources_list.addItem(f"📁 {p}")
         self._update_sources_count()
-        self.log(f"📥 Orígenes cargados desde Comparar: {lib_a} y {lib_b}")
+        self.log(f"📥 {len(self.sources)} carpetas de origen cargadas automáticamente.")
+
+    def preset_destination(self, dest: Path) -> None:
+        """Set destination folder programmatically."""
+        p = dest.resolve()
+        self.destination = p
+        self.dest_path_label.setText(str(p))
+        self.dest_path_label.setStyleSheet(
+            f"font-size: 12px; font-weight: 600; padding: 8px 12px; "
+            f"background-color: {palette().bg}; border: 1px solid {palette().border}; "
+            "border-radius: 6px; color: #34d399;"
+        )
+        self.context.settings.set("ui.fusion_dest_path", str(p))
+        self.log(f"🎯 Carpeta de destino configurada: {p}")
+
+    def prompt_start_fusion(self) -> None:
+        """Offer to launch fusion directly when sources and destination are ready."""
+        if not self.sources or not self.destination:
+            return
+        reply = QMessageBox.question(
+            self,
+            "Iniciar Fusión",
+            f"Se han configurado automáticamente {len(self.sources)} carpetas de origen y el destino:\n\n"
+            f"Destino: {self.destination}\n\n"
+            "¿Deseas iniciar la consolidación y copia sin duplicados ahora mismo?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if reply == QMessageBox.Yes:
+            self._start_fusion()
+
+    def preset_libraries(self, lib_a: Path, lib_b: Path) -> None:
+        """Integration helper when navigating from the Compare page."""
+        self.preset_sources([lib_a, lib_b])
 
     def auto_plan_from_comparison(self) -> None:
         if self.sources and self.destination:

@@ -355,10 +355,22 @@ class ComparePage(QWidget):
             self.navigator(page)
 
     def _go_fusion(self) -> None:
-        """Send both compared folders to Fusión and auto-generate the plan."""
+        """Send both compared folders to Fusión and ask directly for destination."""
         if self.navigator is None:
             return
-        self.navigator("Fusión", (self.folder_a, self.folder_b), auto_plan=True)
+        sources = [f for f in (self.folder_a, self.folder_b) if f and Path(f).exists()]
+        if not sources:
+            self.navigator("Fusión")
+            return
+
+        dest = QFileDialog.getExistingDirectory(
+            self,
+            "Seleccionar carpeta de DESTINO único (donde consolidar la música sin duplicados)",
+        )
+        if not dest:
+            return
+
+        self.navigator("Fusión", tuple(sources), destination=dest, auto_run_prompt=True)
 
     def _compare(self) -> None:
         if self._mode == _MODE_FILES and self.file_a and self.file_b:
