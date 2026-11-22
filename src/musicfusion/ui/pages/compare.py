@@ -331,6 +331,7 @@ class ComparePage(QWidget):
         self.card_a.set_file(chosen)
         self.card_b.set_file(chosen)
         self.status.setText("Misma carpeta en A y B: se detectarán los duplicados internos.")
+        self._save_compared_sources()
 
     def _pick_into_folder(self, which: str) -> None:
         path = QFileDialog.getExistingDirectory(self, "Elegir carpeta de música")
@@ -344,6 +345,13 @@ class ComparePage(QWidget):
         else:
             self.folder_b = chosen
             self.card_b.set_file(chosen)
+        self._save_compared_sources()
+
+    def _save_compared_sources(self) -> None:
+        sources = [str(f.resolve()) for f in (self.folder_a, self.folder_b) if f and Path(f).is_dir()]
+        if sources:
+            unique = list(dict.fromkeys(sources))
+            self.context.settings.set("app.last_compared_sources", unique)
 
     # ----------------------------------------------------------------- compare
     def set_navigator(self, navigator: Callable[..., None]) -> None:
@@ -358,7 +366,12 @@ class ComparePage(QWidget):
         """Send both compared folders to Fusión and ask directly for destination."""
         if self.navigator is None:
             return
-        sources = [f for f in (self.folder_a, self.folder_b) if f and Path(f).exists()]
+        self._save_compared_sources()
+        sources = [f.resolve() for f in (self.folder_a, self.folder_b) if f and Path(f).is_dir()]
+        if not sources:
+            saved = self.context.settings.get("app.last_compared_sources", [])
+            if saved and isinstance(saved, list):
+                sources = [Path(p).resolve() for p in saved if p and Path(p).is_dir()]
         if not sources:
             self.navigator("Fusión")
             return
@@ -379,6 +392,7 @@ class ComparePage(QWidget):
             self.jobs.run(self._files_job, self.file_a, self.file_b)
             return
         if self._mode in (_MODE_FOLDERS, _MODE_BROAD) and self.folder_a and self.folder_b:
+            self._save_compared_sources()
             self._pending = self._mode
             self._start_job()
             limit = self.limit_artists_check.isChecked()

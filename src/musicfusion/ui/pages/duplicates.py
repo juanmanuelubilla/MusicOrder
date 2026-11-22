@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
 from sqlalchemy import select
 
 from musicfusion.core.app import AppContext
-from musicfusion.db.models import DuplicateEntry, DuplicateGroup, Track
+from musicfusion.db.models import DuplicateEntry, DuplicateGroup, Library, Track
 from musicfusion.ui.pages._common import JobProgress
 from musicfusion.ui.widgets import ActionBar, BusyRow
 
@@ -86,8 +86,11 @@ class DuplicatesPage(QWidget):
     def _run(self, paths: list[Path] | None = None) -> None:
         if paths:
             self.last_analyzed_paths = [Path(p).resolve() for p in paths]
+            self.context.settings.set("app.last_compared_sources", [str(p) for p in self.last_analyzed_paths])
         else:
             self.last_analyzed_paths = [Path(lib.path).resolve() for lib in self.context.settings.libraries()]
+            if self.last_analyzed_paths:
+                self.context.settings.set("app.last_compared_sources", [str(p) for p in self.last_analyzed_paths])
         self.progress.start("Buscando duplicados…")
         self.jobs.run_duplicates(on_progress=self.progress.record_progress, paths=paths)
 
@@ -130,27 +133,35 @@ class DuplicatesPage(QWidget):
         self.navigator = navigator
 
     def _get_active_sources(self) -> list[Path]:
-        """Collect source directories from current analysis, settings or table paths."""
+        """Collect source directories from current analysis, settings or DB libraries."""
+        broad_roots = {Path("/"), Path("/mnt"), Path("/media"), Path("/Volumes"), Path("/home"), Path("/tmp")}
+
+        # 1. From last analyzed paths in this session
         if hasattr(self, "last_analyzed_paths") and self.last_analyzed_paths:
-            valid = [p for p in self.last_analyzed_paths if p.exists()]
+            valid = [p for p in self.last_analyzed_paths if p.is_dir() and p not in broad_roots]
             if valid:
                 return valid
 
-        # Try configured libraries in settings
-        libs = [Path(l.path).resolve() for l in self.context.settings.libraries() if Path(l.path).exists()]
+        # 2. From saved compared sources in settings
+        saved = self.context.settings.get("app.last_compared_sources", [])
+        if saved and isinstance(saved, list):
+            valid = [Path(p).resolve() for p in saved if p and Path(p).is_dir() and Path(p).resolve() not in broad_roots]
+            if valid:
+                return valid
+
+        # 3. From configured libraries in settings
+        libs = [Path(l.path).resolve() for l in self.context.settings.libraries() if Path(l.path).is_dir() and Path(l.path).resolve() not in broad_roots]
         if libs:
             return libs
 
-        # Infer common root folders from tracks in the duplicates table
-        inferred: set[Path] = set()
+        # 4. From Library records in DB
         with self.context.db.session_scope() as session:
-            tracks = session.scalars(select(Track).limit(100)).all()
-            for t in tracks:
-                if t.path:
-                    p = Path(t.path).resolve()
-                    if p.exists() and len(p.parents) >= 2:
-                        inferred.add(p.parents[-2])
-        return list(inferred)[:5]
+            db_libs = session.scalars(select(Library.path)).all()
+            valid = [Path(p).resolve() for p in db_libs if p and Path(p).is_dir() and Path(p).resolve() not in broad_roots]
+            if valid:
+                return valid
+
+        return []
 
     def _go_fusion(self) -> None:
         if not hasattr(self, "navigator") or self.navigator is None:

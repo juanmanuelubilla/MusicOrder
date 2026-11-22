@@ -200,6 +200,9 @@ class MainWindow(QMainWindow):
                 sources = [Path(p) for p in payload if p and isinstance(p, (str, Path))]
                 if sources:
                     fusion_page.preset_sources(sources)
+            else:
+                if not fusion_page.sources:
+                    fusion_page.load_last_compared_sources(silent=True)
             if "destination" in kwargs and kwargs["destination"]:
                 fusion_page.preset_destination(Path(kwargs["destination"]))
             if kwargs.get("auto_run_prompt"):
@@ -209,8 +212,11 @@ class MainWindow(QMainWindow):
 
     def _on_page_changed(self, index: int) -> None:
         """Keep read-only pages fresh with the data already stored in the DB."""
-        if _NAV[index][0] == "Duplicados":
+        page_name = _NAV[index][0]
+        if page_name == "Duplicados":
             cast(DuplicatesPage, self.pages[index]).refresh()
+        elif page_name == "Fusión":
+            cast(FusionPage, self.pages[index]).on_page_shown()
 
     def _about(self) -> None:
         QMessageBox.about(

@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
 )
 
 from musicfusion.core.app import AppContext
+from musicfusion.db.models import Library
 from musicfusion.merge.engine import (
     FusionEngine,
     FusionOptions,
@@ -34,6 +35,10 @@ from musicfusion.merge.engine import (
     ProgressData,
 )
 from musicfusion.ui.widgets import ActionBar, StatCard, palette
+from sqlalchemy import select
+
+
+_BROAD_ROOTS = {Path("/"), Path("/mnt"), Path("/media"), Path("/Volumes"), Path("/home"), Path("/tmp")}
 
 
 def _fmt_size(bytes_val: int) -> str:
@@ -174,6 +179,11 @@ class FusionPage(QWidget):
         btn_clear_src.setToolTip("Vaciar todas las carpetas de origen")
         btn_clear_src.clicked.connect(self._clear_sources)
         orig_buttons.addWidget(btn_clear_src)
+
+        btn_load_compared = QPushButton("🔄 Cargar de Comparación")
+        btn_load_compared.setToolTip("Cargar automáticamente las carpetas analizadas en la sección Comparar o Duplicados")
+        btn_load_compared.clicked.connect(lambda: self.load_last_compared_sources(silent=False))
+        orig_buttons.addWidget(btn_load_compared)
         orig_box.addLayout(orig_buttons)
 
         dirs_layout.addWidget(orig_frame, 1)
@@ -601,11 +611,51 @@ class FusionPage(QWidget):
         self._clear_sources()
         for src in sources:
             p = src.resolve()
-            if p not in self.sources:
+            if p in _BROAD_ROOTS:
+                continue
+            if p not in self.sources and p.is_dir():
                 self.sources.append(p)
                 self.sources_list.addItem(f"📁 {p}")
         self._update_sources_count()
-        self.log(f"📥 {len(self.sources)} carpetas de origen cargadas automáticamente.")
+        if self.sources:
+            self.log(f"📥 {len(self.sources)} carpetas de origen cargadas automáticamente.")
+
+    def load_last_compared_sources(self, silent: bool = False) -> None:
+        """Load source directories from the last comparison or duplicate scan."""
+        saved = self.context.settings.get("app.last_compared_sources", [])
+        valid: list[Path] = []
+        if saved and isinstance(saved, list):
+            valid = [Path(p).resolve() for p in saved if p and Path(p).is_dir() and Path(p).resolve() not in _BROAD_ROOTS]
+
+        if not valid:
+            with self.context.db.session_scope() as session:
+                db_libs = session.scalars(select(Library.path)).all()
+                valid = [Path(p).resolve() for p in db_libs if p and Path(p).is_dir() and Path(p).resolve() not in _BROAD_ROOTS]
+
+        if not valid:
+            valid = [Path(l.path).resolve() for l in self.context.settings.libraries() if Path(l.path).is_dir() and Path(l.path).resolve() not in _BROAD_ROOTS]
+
+        if not valid:
+            if not silent:
+                QMessageBox.information(
+                    self,
+                    "Sin carpetas de comparación",
+                    "No se encontraron carpetas previas de comparación guardadas.\n\n"
+                    "Puedes agregarlas manualmente con el botón '➕ Agregar carpeta…' o seleccionarlas en la sección 'Comparar'.",
+                )
+            return
+
+        self.preset_sources(valid)
+        self.log(f"🔄 Se cargaron {len(valid)} carpetas desde la comparación previa.")
+
+    def on_page_shown(self) -> None:
+        """Sanitize sources and auto-load if empty when the user switches to this page."""
+        # Purge broad roots like /mnt if previously present
+        clean_sources = [p for p in self.sources if p not in _BROAD_ROOTS and p.is_dir()]
+        if len(clean_sources) != len(self.sources):
+            self.preset_sources(clean_sources)
+        if not self.sources:
+            self.load_last_compared_sources(silent=True)
 
     def preset_destination(self, dest: Path) -> None:
         """Set destination folder programmatically."""
