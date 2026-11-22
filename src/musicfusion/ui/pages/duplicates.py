@@ -42,6 +42,7 @@ class DuplicatesPage(QWidget):
         bar.add_button("En carpeta…", clicked=self._analyze_folder)
         bar.add_button("Entre dos carpetas…", clicked=self._analyze_two)
         bar.add_button("Exportar informe…", clicked=self._export)
+        bar.add_button("🚀 Unir sin duplicados (Fusión)…", clicked=self._go_fusion)
         bar.add_stretch()
         layout.addWidget(bar)
 
@@ -119,6 +120,13 @@ class DuplicatesPage(QWidget):
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 self.table.setItem(row_index, col, item)
         self.status.setText(f"{len(rows)} entradas en {len(set(r[0] for r in rows))} grupos.")
+
+    def set_navigator(self, navigator: object) -> None:
+        self.navigator = navigator
+
+    def _go_fusion(self) -> None:
+        if hasattr(self, "navigator") and self.navigator is not None:
+            self.navigator("Fusión")
 
     def _export(self) -> None:
         target, _ = QFileDialog.getSaveFileName(

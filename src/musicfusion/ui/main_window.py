@@ -91,6 +91,8 @@ class MainWindow(QMainWindow):
 
         compare_page = cast(ComparePage, self.pages[self._index_of("Comparar")])
         compare_page.set_navigator(self._open_page)
+        duplicates_page = cast(DuplicatesPage, self.pages[self._index_of("Duplicados")])
+        duplicates_page.set_navigator(self._open_page)
         dashboard = cast(DashboardPage, self.pages[self._index_of("Panel")])
         dashboard.set_navigator(self._navigate_task)
 
