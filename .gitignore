@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Application data
+musicfusion.db
+reports/
+logs/
+*.sqlite*
+~/.config/musicfusion/
+
+# OS / IDE
+.DS_Store
+*.swp

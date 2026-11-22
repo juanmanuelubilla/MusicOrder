@@ -1,0 +1,69 @@
+# Perfil de ejemplo. Importar con:
+#   python -m musicfusion --profile profiles/sample.yaml
+app:
+  theme: dark
+  language: es
+  confirm_destructive: true
+  max_threads: 4
+scan:
+  hash_algorithm: sha256
+  compute_fingerprints: false
+  store_pictures: true
+watch:
+  enabled: true
+  interval_seconds: 1.2
+compare:
+  weights:
+    artist: 20
+    album: 18
+    title: 20
+    year: 8
+    duration: 14
+    tracks: 8
+    fingerprint: 6
+    isrc: 6
+duplicates:
+  hash_group: true
+  fuzzy: true
+  fuzzy_threshold: 90.0
+  classify: true
+matching:
+  artist_weight: 20
+  album_weight: 20
+  title_weight: 30
+  track_number_weight: 10
+  disc_number_weight: 5
+  duration_weight: 10
+  year_weight: 5
+  confirmed_threshold: 95
+  very_high_threshold: 90
+  high_threshold: 80
+  possible_threshold: 70
+  low_threshold: 50
+  fingerprint_weight: 35
+  fingerprint_penalty: 15
+  album_context_weight: 10
+  edition_edit_cap: 96
+  edition_cap: 94
+  version_cap: 93
+  duration_relative_tolerance: 0.03
+  duration_absolute_ms: 1500
+decision:
+  weights:
+    quality: 40
+    metadata: 20
+    artwork: 15
+    codec: 15
+    preference: 10
+  min_gap_for_auto: 1.0
+services:
+  musicbrainz:
+    enabled: true
+  acoustid:
+    enabled: false
+    key: ""
+renaming:
+  pattern: "{artist}/{year} - {album}/{track:02d} - {title}"
+reports:
+  directory: reports
+log_level: INFO

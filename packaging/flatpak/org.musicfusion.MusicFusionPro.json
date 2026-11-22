@@ -1,0 +1,46 @@
+{
+    "id": "org.musicfusion.MusicFusionPro",
+    "branch": "stable",
+    "runtime": "org.kde.Platform",
+    "runtime-version": "6.8",
+    "sdk": "org.kde.Sdk",
+    "base": "org.freedesktop.Sdk.Extension.python311",
+    "base-version": "23.08",
+    "command": "/app/bin/musicfusion",
+    "finish-args": [
+        "--share=network",
+        "--share=ipc",
+        "--socket=wayland",
+        "--socket=x11",
+        "--device=all",
+        "--filesystem=home",
+        "--filesystem=/media",
+        "--filesystem=/mnt",
+        "--talk-name=org.freedesktop.Notifications"
+    ],
+    "modules": [
+        {
+            "name": "python3-pip",
+            "buildsystem": "simple",
+            "build-commands": [
+                "pip3 install --no-index --find-links=\"file://${PWD}\" pip"
+            ]
+        },
+        {
+            "name": "musicfusion",
+            "buildsystem": "simple",
+            "build-commands": [
+                "pip3 install --prefix=/app .",
+                "mkdir -p /app/bin",
+                "cp packaging/musicfusion.desktop /app/share/applications/",
+                "cp packaging/icons/musicfusion.svg /app/share/icons/hicolor/scalable/apps/ 2>/dev/null || true"
+            ],
+            "sources": [
+                {
+                    "type": "dir",
+                    "path": "../.."
+                }
+            ]
+        }
+    ]
+}

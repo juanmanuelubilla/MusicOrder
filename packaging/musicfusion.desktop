@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=MusicFusion Pro
+GenericName=Music library manager
+Comment=Gestiona, busca duplicados y fusiona bibliotecas musicales
+Exec=/home/pi/MusicOrder/musicfusion.sh %f
+Icon=audio-x-generic
+Terminal=false
+Categories=AudioVideo;Audio;Qt;
+Keywords=music;library;duplicates;fusion;organize
+StartupNotify=true
