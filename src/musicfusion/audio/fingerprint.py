@@ -79,7 +79,7 @@ def fingerprint_file(
         return None
     try:
         if backend == "fpcalc":
-            return _fpcalc_fingerprint(path)
+            return _fpcalc_fingerprint(path, max_duration=max_duration)
         return _chromaprint_fingerprint(path, max_duration=max_duration)
     except Exception as exc:  # noqa: BLE001 - one bad file must not kill the run
         logger.warning("fingerprint failed for %s: %s", path, exc)
@@ -141,11 +141,15 @@ def _chromaprint_fingerprint(path: str, *, max_duration: float) -> FingerprintRe
 # ---------------------------------------------------------------------------
 
 
-def _fpcalc_fingerprint(path: str) -> FingerprintResult:
+def _fpcalc_fingerprint(path: str, max_duration: float = 120.0) -> FingerprintResult:
     fpcalc = shutil.which(_FPCALC)
     if not fpcalc:
         raise RuntimeError("fpcalc binary not found")
-    proc = subprocess.run([fpcalc, "-json", str(path)], capture_output=True, check=False)
+    cmd = [fpcalc, "-json"]
+    if max_duration:
+        cmd.extend(["-length", str(int(max_duration))])
+    cmd.append(str(path))
+    proc = subprocess.run(cmd, capture_output=True, check=False)
     if proc.returncode != 0 or not proc.stdout:
         raise RuntimeError("fpcalc failed to fingerprint the file")
     payload = json.loads(proc.stdout)

@@ -129,6 +129,7 @@ class DuplicateDetector:
             by_artist.setdefault(key, []).append(track)
 
         groups: list[DetectedGroup] = []
+        track_to_group: dict[int, DetectedGroup] = {}
         buckets = list(by_artist.items())
         for bucket_index, (_key, candidates) in enumerate(buckets, start=1):
             if on_progress:
@@ -140,26 +141,49 @@ class DuplicateDetector:
                 dur_ok = duration_similarity(a.duration_ms, b.duration_ms)
                 if dur_ok == 0 and ratio < 96:
                     continue
-                added = self._add_pair(groups, a, b, reason="fuzzy",
-                                       confidence=round(ratio, 1))
-                if not added:
-                    continue
+                self._add_pair(groups, track_to_group, a, b, reason="fuzzy", confidence=round(ratio, 1))
         return groups
 
     def _add_pair(
-        self, groups: list[DetectedGroup], a: TrackRef, b: TrackRef,
-        reason: str, confidence: float,
+        self,
+        groups: list[DetectedGroup],
+        track_to_group: dict[int, DetectedGroup],
+        a: TrackRef,
+        b: TrackRef,
+        reason: str,
+        confidence: float,
     ) -> bool:
-        for group in groups:
-            if a.id in group.track_ids or b.id in group.track_ids:
-                if a.id not in group.track_ids:
-                    group.track_ids.append(a.id)
-                if b.id not in group.track_ids:
-                    group.track_ids.append(b.id)
-                group.confidence = max(group.confidence, confidence)
-                return True
-        groups.append(DetectedGroup(reason=reason, track_ids=[a.id, b.id],
-                                    confidence=confidence))
+        group_a = track_to_group.get(a.id)
+        group_b = track_to_group.get(b.id)
+
+        if group_a is not None and group_b is not None:
+            if group_a is not group_b:
+                for tid in group_b.track_ids:
+                    if tid not in group_a.track_ids:
+                        group_a.track_ids.append(tid)
+                    track_to_group[tid] = group_a
+                group_a.confidence = max(group_a.confidence, group_b.confidence, confidence)
+                if group_b in groups:
+                    groups.remove(group_b)
+            else:
+                group_a.confidence = max(group_a.confidence, confidence)
+            return True
+
+        target_group = group_a or group_b
+        if target_group is not None:
+            if a.id not in target_group.track_ids:
+                target_group.track_ids.append(a.id)
+                track_to_group[a.id] = target_group
+            if b.id not in target_group.track_ids:
+                target_group.track_ids.append(b.id)
+                track_to_group[b.id] = target_group
+            target_group.confidence = max(target_group.confidence, confidence)
+            return True
+
+        new_group = DetectedGroup(reason=reason, track_ids=[a.id, b.id], confidence=confidence)
+        groups.append(new_group)
+        track_to_group[a.id] = new_group
+        track_to_group[b.id] = new_group
         return True
 
     def run(

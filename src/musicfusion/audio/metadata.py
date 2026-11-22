@@ -281,22 +281,21 @@ def read_metadata(path: str | Path) -> TrackInfo | None:
     info = TrackInfo()
     try:
         audio_tags = getattr(audio, "tags", None)
-        if audio_tags is None:
-            return info
-        if isinstance(audio, ID3FileType):
-            _read_id3(info, audio)
-        elif isinstance(audio, FLAC):
-            _fill_vorbis(info, audio_tags)
-        elif isinstance(audio, (OggVorbis,
-                                OggOpus,
-                                OggFLAC)):
-            _fill_vorbis(info, audio_tags)
-        elif isinstance(audio, MP4):
-            _read_mp4(info, audio)
-        elif isinstance(audio, APEv2File):
-            _fill_ape(info, audio_tags)
-        elif isinstance(audio, AIFF):
-            _read_id3(info, audio)
+        if audio_tags is not None:
+            if isinstance(audio, ID3FileType):
+                _read_id3(info, audio)
+            elif isinstance(audio, FLAC):
+                _fill_vorbis(info, audio_tags)
+            elif isinstance(audio, (OggVorbis,
+                                    OggOpus,
+                                    OggFLAC)):
+                _fill_vorbis(info, audio_tags)
+            elif isinstance(audio, MP4):
+                _read_mp4(info, audio)
+            elif isinstance(audio, APEv2File):
+                _fill_ape(info, audio_tags)
+            elif isinstance(audio, AIFF):
+                _read_id3(info, audio)
         _fill_audio_info(info, audio)
     except Exception as error:
         logger.warning("Tag parsing failed for %s: %s", file_path, error)

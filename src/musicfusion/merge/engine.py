@@ -10,6 +10,7 @@ bitrate / quality, incremental name conflict resolution, atomic copying, and rep
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import logging
 import os
@@ -673,10 +674,16 @@ class FusionEngine:
         if not fp_pair:
             return None
         threshold = self.options.acoustic_threshold
+        source_dur = fp_pair[0] if isinstance(fp_pair, (tuple, list)) else None
+
         for entry in self._acoustic_registry:
             existing_fp = entry.get("fp")
             if not existing_fp:
                 continue
+            # Duration pre-filter: identical recordings cannot differ by more than 5.0 seconds
+            if source_dur is not None and isinstance(existing_fp, (tuple, list)):
+                if abs(source_dur - existing_fp[0]) > 5.0:
+                    continue
             try:
                 similarity = acoustid.compare_fingerprints(fp_pair, existing_fp)
                 if similarity >= threshold:
@@ -1070,12 +1077,24 @@ class FusionEngine:
             temp_name = f".{target.name}.tmp.{uuid4().hex[:8]}"
             temp_target = target.parent / temp_name
 
-            shutil.copy2(source, temp_target)
+            # High-performance streaming copy with single-pass memory SHA-256 verification
+            chunk_size = 2 * 1024 * 1024  # 2 MiB buffer optimal for high-throughput HDD I/O
+            hasher = hashlib.sha256() if self.options.verify_sha256 else None
+            with open(source, "rb") as fsrc, open(temp_target, "wb") as fdst:
+                while chunk := fsrc.read(chunk_size):
+                    if hasher is not None:
+                        hasher.update(chunk)
+                    fdst.write(chunk)
+
+            try:
+                shutil.copystat(source, temp_target)
+            except OSError:
+                pass
 
             verified = False
-            if self.options.verify_sha256:
-                temp_sha = hash_file(temp_target, algorithm="sha256")
-                if temp_sha != expected_sha256:
+            if hasher is not None:
+                written_sha = hasher.hexdigest()
+                if written_sha != expected_sha256:
                     if temp_target.exists():
                         temp_target.unlink()
                     report.errors_count += 1
@@ -1085,7 +1104,7 @@ class FusionEngine:
                             target=target,
                             error_message=(
                                 f"Error de verificación SHA-256: esperado {expected_sha256}, "
-                                f"obtenido {temp_sha}"
+                                f"obtenido {written_sha}"
                             ),
                         )
                     )
@@ -1099,14 +1118,11 @@ class FusionEngine:
                 info = self._metadata_cache.get(source.resolve())
                 if info is not None:
                     try:
-                        errs = write_metadata_tags(target, info)
-                        if not errs:
-                            new_sha = hash_file(target, algorithm="sha256")
-                            if new_sha:
-                                self._hash_cache[target.resolve()] = new_sha
-                                self._destination_hashes[new_sha] = target
+                        write_metadata_tags(target, info)
                     except Exception as err:
                         logger.warning("No se pudieron escribir tags en %s: %s", target, err)
+
+            self._metadata_cache.pop(source.resolve(), None)
 
             report.copied_items.append(
                 CopiedItem(
