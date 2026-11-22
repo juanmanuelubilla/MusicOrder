@@ -18,6 +18,7 @@ import re
 import shutil
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -276,6 +277,7 @@ class FusionEngine:
         self._metadata_cache: dict[Path, TrackInfo] = {}
         # Stores: list of dicts: {"fp": (duration, fp_bits), "quality": score, "bitrate": br, "target": Path, "sha256": str, "source": Path}
         self._acoustic_registry: list[dict[str, Any]] = []
+        self._max_workers = min(16, os.cpu_count() or 4)
 
     def cancel(self) -> None:
         """Signal cooperative cancellation."""
@@ -445,6 +447,43 @@ class FusionEngine:
 
         dest_files = self._discover_files(dest, include_subdirs=True, on_progress=on_progress)
         total = len(dest_files)
+
+        # Parallelize acoustic fingerprint decoding across all CPU cores for existing destination files
+        audio_dest = [f for f in dest_files if self._is_audio(f)] if self.options.acoustic_detection else []
+        if audio_dest:
+            if on_progress:
+                on_progress(
+                    ProgressData(
+                        stage="indexing_destination",
+                        files_found=total,
+                        status_message=f"Decodificando huellas en destino ({len(audio_dest)} archivos en {self._max_workers} hilos)…",
+                    )
+                )
+
+            def _index_worker(f: Path) -> tuple[Path, Any | None, tuple[float, int]]:
+                fp = None
+                try:
+                    fp = acoustid.fingerprint_file(str(f), maxlength=120)
+                except Exception:
+                    pass
+                q = (0.0, 0)
+                try:
+                    qual = probe_quality(f)
+                    if qual:
+                        q = (qual.score(), qual.bitrate_kbps or 0)
+                except Exception:
+                    pass
+                return f, fp, q
+
+            with ThreadPoolExecutor(max_workers=self._max_workers) as ex:
+                for f, fp, (q_score, br) in ex.map(_index_worker, audio_dest):
+                    if self._cancel_requested:
+                        break
+                    res_f = f.resolve()
+                    if fp:
+                        self._fp_cache[res_f] = fp
+                        self._quality_cache[res_f] = (q_score, br)
+
         for idx, file_path in enumerate(dest_files, start=1):
             if self._cancel_requested:
                 break
@@ -762,6 +801,26 @@ class FusionEngine:
         bytes_copied_so_far = 0
         last_progress_time = time.monotonic()
 
+        # Multi-core pipeline: prefetch AcoustID fingerprints and audio qualities in parallel across all CPU threads
+        prefetch_executor = ThreadPoolExecutor(max_workers=self._max_workers)
+        prefetch_window = max(self._max_workers * 2, 16)
+        active_futures: dict[Path, Any] = {}
+
+        def _prefetch_task(fp: Path) -> tuple[Any | None, tuple[float, int]]:
+            fingerprint = None
+            try:
+                fingerprint = acoustid.fingerprint_file(str(fp), maxlength=120)
+            except Exception:
+                pass
+            qual = (0.0, 0)
+            try:
+                qual_probe = probe_quality(fp)
+                if qual_probe:
+                    qual = (qual_probe.score(), qual_probe.bitrate_kbps or 0)
+            except Exception:
+                pass
+            return fingerprint, qual
+
         def _notify(current_idx: int, current_name: str, msg: str) -> None:
             nonlocal last_progress_time
             now = time.monotonic()
@@ -833,10 +892,34 @@ class FusionEngine:
                 _notify(idx, source_file.name, f"❌ Error calculando SHA-256: {source_file.name}")
                 continue
 
-            # Compute quality/bitrate for audio
+            # Maintain lookahead prefetch window across CPU threads
+            if self.options.acoustic_detection:
+                for lookahead_idx in range(idx - 1, min(total_files, idx - 1 + prefetch_window)):
+                    cand_file, _ = all_candidates[lookahead_idx]
+                    cand_res = cand_file.resolve()
+                    if self._is_audio(cand_file) and cand_res not in active_futures and cand_res not in self._fp_cache:
+                        active_futures[cand_res] = prefetch_executor.submit(_prefetch_task, cand_file)
+
+            # Compute quality/bitrate and fingerprint for audio
             source_q_score, source_bitrate = (0.0, 0)
+            source_fp = None
             is_audio_file = self._is_audio(source_file)
-            if is_audio_file:
+
+            if is_audio_file and self.options.acoustic_detection:
+                source_res = source_file.resolve()
+                if source_res in active_futures:
+                    fut = active_futures.pop(source_res)
+                    try:
+                        source_fp, (source_q_score, source_bitrate) = fut.result()
+                        self._fp_cache[source_res] = source_fp
+                        self._quality_cache[source_res] = (source_q_score, source_bitrate)
+                    except Exception:
+                        source_fp = self.compute_fingerprint(source_file)
+                        source_q_score, source_bitrate = self.probe_file_quality(source_file)
+                else:
+                    source_fp = self.compute_fingerprint(source_file)
+                    source_q_score, source_bitrate = self.probe_file_quality(source_file)
+            elif is_audio_file:
                 source_q_score, source_bitrate = self.probe_file_quality(source_file)
 
             # Check Level 1: Exact SHA-256 Duplicate
@@ -859,11 +942,8 @@ class FusionEngine:
 
             # Check Level 2: Acoustic Fingerprint Duplicate (different compression / bitrate / tags)
             acoustic_match = None
-            source_fp = None
-            if is_audio_file and self.options.acoustic_detection:
-                source_fp = self.compute_fingerprint(source_file)
-                if source_fp:
-                    acoustic_match = self._find_acoustic_match(source_fp)
+            if is_audio_file and self.options.acoustic_detection and source_fp:
+                acoustic_match = self._find_acoustic_match(source_fp)
 
             if acoustic_match is not None:
                 # SAME SONG DETECTED BY ACOUSTIC SIGNATURE!
@@ -1038,6 +1118,8 @@ class FusionEngine:
                         )
                     )
                 break
+
+        prefetch_executor.shutdown(wait=False, cancel_futures=True)
 
         report.elapsed_seconds = time.monotonic() - start_time
         if on_progress:
