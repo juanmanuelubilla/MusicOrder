@@ -103,3 +103,49 @@ def _make_settings(tmp_path: Path, lib: Path) -> Settings:
     settings.set("watch.enabled", False)
     settings.set("scan.compute_fingerprints", False)
     return settings
+
+
+@pytest.mark.skipif(not _av_available(), reason="ffmpeg required")
+def test_database_reset_and_vacuum(tmp_path: Path) -> None:
+    """Verify that reset_database completely wipes all records and vacuum succeeds."""
+    lib = _make_library(tmp_path / "music", count=3)
+    settings = _make_settings(tmp_path, lib)
+
+    LibraryIndexer(settings).run()
+    db = Database(settings.db_path)
+
+    with db.session_scope() as session:
+        assert session.query(Track).count() == 3
+
+    assert db.get_database_size_bytes() > 0
+
+    # Reset database
+    db.reset_database()
+
+    with db.session_scope() as session:
+        assert session.query(Track).count() == 0
+        assert session.query(Library).count() == 0
+
+    # Vacuum should succeed on clean DB
+    db.vacuum()
+
+
+@pytest.mark.skipif(not _av_available(), reason="ffmpeg required")
+def test_database_remove_library_records(tmp_path: Path) -> None:
+    """Verify that removing a single library removes its tracks from the DB."""
+    lib = _make_library(tmp_path / "music", count=2)
+    settings = _make_settings(tmp_path, lib)
+
+    LibraryIndexer(settings).run()
+    db = Database(settings.db_path)
+
+    with db.session_scope() as session:
+        assert session.query(Track).count() == 2
+
+    removed = db.remove_library_records(str(lib))
+    assert removed == 2
+
+    with db.session_scope() as session:
+        assert session.query(Track).count() == 0
+        assert session.query(Library).count() == 0
+

@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QListWidget,
     QListWidgetItem,
+    QMessageBox,
     QVBoxLayout,
     QWidget,
 )
@@ -40,6 +41,7 @@ class LibrariesPage(QWidget):
         bar.add_button("Quitar seleccionada", clicked=self._remove_library)
         bar.add_button("Escanear", clicked=self._scan_all)
         bar.add_button("Escaneo completo", clicked=lambda: self._scan_all(full=True))
+        bar.add_button("🗑️ Vaciar biblioteca…", danger=True, clicked=self._clear_library)
         bar.add_stretch()
         layout.addWidget(bar)
 
@@ -76,6 +78,24 @@ class LibrariesPage(QWidget):
         if item is None:
             return
         lib: LibraryConfig = item.data(Qt.UserRole)
+
+        reply = QMessageBox.question(
+            self,
+            "Quitar biblioteca",
+            f"¿Deseas quitar la biblioteca '{lib.name}'?\n\nRuta: {lib.path}\n\n"
+            "¿Deseas eliminar también sus canciones y registros indexados de la base de datos?",
+            QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+            QMessageBox.Yes,
+        )
+        if reply == QMessageBox.Cancel:
+            return
+
+        if reply == QMessageBox.Yes:
+            try:
+                self.context.db.remove_library_records(lib.path)
+            except Exception as exc:
+                pass
+
         data = self.context.settings.data.get("libraries", {})
         for key, spec in list(data.items()):
             path = spec["path"] if isinstance(spec, dict) else spec
@@ -83,6 +103,50 @@ class LibrariesPage(QWidget):
                 del data[key]
         self.context.settings.save()
         self.refresh()
+
+    def _clear_library(self) -> None:
+        """Prompt to clear all database records and optionally configured folders."""
+        reply = QMessageBox.question(
+            self,
+            "Vaciar biblioteca y base de datos",
+            "¿Estás seguro de que deseas vaciar todos los registros de la biblioteca?\n\n"
+            "• Se eliminarán todas las canciones, álbumes, artistas y huellas indexadas de la base de datos.\n"
+            "• La base de datos quedará completamente limpia.\n"
+            "• TUS ARCHIVOS DE MÚSICA EN EL DISCO DURO NO SE BORRARÁN NI MODIFICARÁN.\n\n"
+            "¿Deseas continuar?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        clear_folders = QMessageBox.question(
+            self,
+            "Carpetas configuradas",
+            "¿Deseas también quitar todas las carpetas de la lista de bibliotecas?\n\n"
+            "• 'Sí': Borra los registros de la base de datos y vacía la lista de carpetas.\n"
+            "• 'No': Borra los registros de la base de datos pero conserva las carpetas en la lista para volver a escanearlas limpias.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+
+        try:
+            self.context.db.reset_database()
+            if clear_folders == QMessageBox.Yes:
+                self.context.settings.data["libraries"] = {}
+                self.context.settings.save()
+            self.refresh()
+            QMessageBox.information(
+                self,
+                "Biblioteca limpia",
+                "La base de datos y los registros de la biblioteca han sido vaciados con éxito.",
+            )
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Error al vaciar",
+                f"Ocurrió un error al vaciar la base de datos:\n{exc}",
+            )
 
     def _open_folder(self, item: QListWidgetItem) -> None:
         lib: LibraryConfig = item.data(Qt.UserRole)

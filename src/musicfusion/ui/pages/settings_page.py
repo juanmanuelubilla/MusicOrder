@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -81,6 +82,41 @@ class SettingsPage(QWidget):
         ai_form.addRow("Modelo:", model_row)
         layout.addLayout(ai_form)
 
+        # ------------------------------------------------ Base de datos y Almacenamiento
+        db_label = QLabel("Base de datos y Almacenamiento")
+        db_label.setStyleSheet("font-size: 15px; font-weight: 600;")
+        layout.addWidget(db_label)
+
+        db_form = QFormLayout()
+        db_form.setSpacing(10)
+
+        self.db_path_label = QLabel()
+        self.db_path_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        db_form.addRow("Archivo de base de datos:", self.db_path_label)
+
+        self.db_size_label = QLabel()
+        db_form.addRow("Tamaño actual:", self.db_size_label)
+
+        db_buttons = QHBoxLayout()
+        self.btn_vacuum = QPushButton("🧹 Optimizar (VACUUM)")
+        self.btn_vacuum.setToolTip("Compacta la base de datos y recupera espacio libre en el disco.")
+        self.btn_vacuum.clicked.connect(self._vacuum_db)
+
+        self.btn_reset_db = QPushButton("🗑️ Vaciar / Reiniciar base de datos")
+        self.btn_reset_db.setStyleSheet(
+            "background-color: #7f1d1d; color: #fca5a5; font-weight: 600; padding: 6px 14px; border-radius: 6px;"
+        )
+        self.btn_reset_db.setToolTip(
+            "Elimina todos los datos indexados de la base de datos dejando una estructura completamente nueva y vacía."
+        )
+        self.btn_reset_db.clicked.connect(self._reset_db)
+
+        db_buttons.addWidget(self.btn_vacuum)
+        db_buttons.addWidget(self.btn_reset_db)
+        db_buttons.addStretch()
+        db_form.addRow("Mantenimiento:", db_buttons)
+        layout.addLayout(db_form)
+
         bar = ActionBar()
         bar.add_button("Guardar", primary=True, clicked=self._save)
         bar.add_button("Exportar perfil…", clicked=self._export_profile)
@@ -107,6 +143,64 @@ class SettingsPage(QWidget):
             self._refresh_models(select=current_model)
         elif current_model:
             self.ai_model_combo.setCurrentText(current_model)
+        self._update_db_info()
+
+    def _update_db_info(self) -> None:
+        db_path = self.context.settings.db_path
+        self.db_path_label.setText(str(db_path))
+        try:
+            size_bytes = self.context.db.get_database_size_bytes()
+            if size_bytes < 1024:
+                size_str = f"{size_bytes} B"
+            elif size_bytes < 1024 * 1024:
+                size_str = f"{size_bytes / 1024:.1f} KB"
+            else:
+                size_str = f"{size_bytes / (1024 * 1024):.2f} MB"
+            self.db_size_label.setText(size_str)
+        except Exception:
+            self.db_size_label.setText("No disponible")
+
+    def _vacuum_db(self) -> None:
+        try:
+            self.context.db.vacuum()
+            self._update_db_info()
+            QMessageBox.information(
+                self,
+                "Optimización",
+                "Base de datos optimizada con éxito (VACUUM completado).",
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Error", f"No se pudo optimizar la base de datos:\n{exc}")
+
+    def _reset_db(self) -> None:
+        reply = QMessageBox.question(
+            self,
+            "Vaciar y reiniciar base de datos",
+            "¿Estás seguro de que deseas vaciar completamente la base de datos?\n\n"
+            "• Se eliminarán todos los registros de canciones, artistas, álbumes, duplicados e historial.\n"
+            "• La base de datos quedará 100% vacía y limpia.\n"
+            "• TUS ARCHIVOS DE MÚSICA EN EL DISCO NO SE BORRARÁN NI MODIFICARÁN.\n\n"
+            "¿Deseas continuar?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        try:
+            self.context.db.reset_database()
+            self._update_db_info()
+            QMessageBox.information(
+                self,
+                "Base de datos vaciada",
+                "La base de datos ha sido vaciada y reiniciada correctamente.",
+            )
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Error al vaciar",
+                f"No se pudo vaciar la base de datos:\n{exc}",
+            )
 
     def _refresh_models(self, select: str | None = None) -> None:
         from musicfusion.services.ollamalocal import OllamaClient

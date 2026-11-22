@@ -144,3 +144,70 @@ class Database:
     def dispose(self) -> None:
         """Release all pooled connections."""
         self.engine.dispose()
+
+    def reset_database(self) -> None:
+        """Completely purge all database data, recreate clean tables and VACUUM."""
+        self.engine.dispose()
+        try:
+            if self.path.exists():
+                self.path.unlink()
+            for ext in ("-wal", "-shm", ".wal", ".shm"):
+                sidecar = self.path.parent / f"{self.path.name}{ext}"
+                if sidecar.exists():
+                    sidecar.unlink()
+        except OSError:
+            # If file unlinking fails (e.g. open handles), drop tables
+            with self.engine.begin() as conn:
+                conn.exec_driver_sql("PRAGMA foreign_keys=OFF")
+                for m in reversed(all_models()):
+                    tbl = getattr(m, "__tablename__", None)
+                    if tbl:
+                        conn.exec_driver_sql(f'DROP TABLE IF EXISTS "{tbl}"')
+                conn.exec_driver_sql("PRAGMA foreign_keys=ON")
+
+        self.engine = create_database_engine(self.path)
+        self.SessionFactory.configure(bind=self.engine)
+        self.create_schema()
+        try:
+            with self.engine.connect() as conn:
+                conn.exec_driver_sql("VACUUM")
+        except Exception:
+            pass
+
+    def vacuum(self) -> None:
+        """Run SQLite VACUUM to reclaim space and defragment."""
+        with self.engine.connect() as conn:
+            conn.exec_driver_sql("VACUUM")
+
+    def get_database_size_bytes(self) -> int:
+        """Return total size of the database file and WAL/SHM sidecars in bytes."""
+        total = 0
+        if self.path.exists():
+            total += self.path.stat().st_size
+        for ext in ("-wal", "-shm", ".wal", ".shm"):
+            sidecar = self.path.parent / f"{self.path.name}{ext}"
+            if sidecar.exists():
+                try:
+                    total += sidecar.stat().st_size
+                except OSError:
+                    pass
+        return total
+
+    def remove_library_records(self, library_path: str) -> int:
+        """Remove all tracks and associated records belonging to a library path."""
+        from sqlalchemy import delete, select
+        from musicfusion.db.models import Album, Artist, Library, Track, TrackFingerprint, TrackHash
+
+        count_removed = 0
+        with self.session_scope() as session:
+            lib = session.scalar(select(Library).where(Library.path == str(library_path)))
+            if lib:
+                tracks = session.scalars(select(Track).where(Track.library_id == lib.id)).all()
+                count_removed = len(tracks)
+                track_ids = [t.id for t in tracks]
+                if track_ids:
+                    session.execute(delete(TrackHash).where(TrackHash.track_id.in_(track_ids)))
+                    session.execute(delete(TrackFingerprint).where(TrackFingerprint.track_id.in_(track_ids)))
+                    session.execute(delete(Track).where(Track.id.in_(track_ids)))
+                session.delete(lib)
+        return count_removed

@@ -480,3 +480,62 @@ def test_acoustic_fingerprint_best_bitrate_wins(tmp_path: Path) -> None:
     assert dest_files[0].stat().st_size > low_mp3.stat().st_size
     assert dest_files[0].stat().st_size == high_mp3.stat().st_size
 
+
+# ---------------------------------------------------------------------------
+# Normalization by tags & structure: Artista/Año - Álbum/00 - Título.ext
+# ---------------------------------------------------------------------------
+def test_normalize_structure_and_tag_updating(tmp_path: Path) -> None:
+    """Validate that when normalize_structure and update_tags are enabled:
+    1. Folder layout in destination becomes: Artista / Año - Álbum / 00 - Título.ext
+    2. Tags inside the destination audio file are updated with artist, album, year, track, title.
+    3. Missing tags are recovered from path clues without losing original information.
+    """
+    import shutil
+    import subprocess
+    from musicfusion.audio.metadata import read_metadata
+
+    if not shutil.which("ffmpeg"):
+        pytest.skip("ffmpeg not available on host system")
+
+    src = tmp_path / "source_library"
+    dest = tmp_path / "normalized_destination"
+    src.mkdir(parents=True)
+
+    track_dir = src / "Babasonicos" / "1992 - Pasto"
+    track_dir.mkdir(parents=True)
+    raw_mp3 = track_dir / "01 - Intro.mp3"
+
+    # Create dummy 1s MP3 without tags
+    subprocess.run(
+        ["ffmpeg", "-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=1", "-ac", "2", str(raw_mp3)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
+    )
+
+    engine = FusionEngine(
+        FusionOptions(
+            sources=[src],
+            destination=dest,
+            normalize_structure=True,
+            update_tags=True,
+        )
+    )
+    # Register canonical name with accent to simulate collation
+    engine.register_canonical_name("Babasónicos")
+
+    report = engine.run()
+    assert report.files_copied == 1
+    assert report.duplicates_detected == 0
+
+    expected_file = dest / "Babasónicos" / "1992 - Pasto" / "01 - Intro.mp3"
+    assert expected_file.exists(), f"Expected normalized file at {expected_file}"
+
+    # Verify tags were written into the destination audio file
+    meta = read_metadata(expected_file)
+    assert meta is not None
+    assert meta.artist == "Babasónicos"
+    assert meta.album == "Pasto"
+    assert meta.year == 1992
+    assert meta.track_no == 1
+    assert meta.title == "Intro"
+
+

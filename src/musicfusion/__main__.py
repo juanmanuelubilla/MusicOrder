@@ -62,6 +62,8 @@ def build_parser() -> argparse.ArgumentParser:
     merge.add_argument("--no-subdirs", action="store_true", help="do not recurse into subdirectories")
     merge.add_argument("--no-verify", action="store_true", help="skip post-copy SHA-256 verification")
     merge.add_argument("--preserve-structure", action="store_true", help="preserve original folder hierarchy in destination")
+    merge.add_argument("--normalize", "--normalize-structure", action="store_true", help="normalize destination layout as Artista/Año - Álbum/00 - Título.ext")
+    merge.add_argument("--update-tags", action="store_true", help="write normalized metadata tags into copied destination files")
     merge.add_argument("--report-txt", default=None, help="export report to TXT file")
     merge.add_argument("--report-csv", default=None, help="export report to CSV file")
 
@@ -219,6 +221,8 @@ def main(argv: list[str] | None = None) -> int:
             include_subdirectories=not args.no_subdirs,
             verify_sha256=not args.no_verify,
             preserve_structure=args.preserve_structure,
+            normalize_structure=args.normalize,
+            update_tags=args.update_tags or args.normalize,
         )
 
         def _cli_progress(p):

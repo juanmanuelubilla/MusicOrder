@@ -26,7 +26,12 @@ import acoustid
 
 from musicfusion.audio.fingerprint import fingerprint_available
 from musicfusion.audio.hashing import hash_file
-from musicfusion.audio.metadata import AUDIO_EXTENSIONS
+from musicfusion.audio.metadata import (
+    AUDIO_EXTENSIONS,
+    TrackInfo,
+    read_metadata,
+    write_metadata_tags,
+)
 from musicfusion.audio.quality import probe_quality
 from musicfusion.core.paths import unique_path
 from musicfusion.core.text import strip_accents
@@ -77,6 +82,8 @@ class FusionOptions:
     include_subdirectories: bool = True
     verify_sha256: bool = True
     preserve_structure: bool = False
+    normalize_structure: bool = False
+    update_tags: bool = False
     include_sidecars: bool = True
     acoustic_detection: bool = True
     acoustic_threshold: float = 0.85
@@ -265,6 +272,7 @@ class FusionEngine:
         self._canonical_names: dict[str, str] = {}
         self._fp_cache: dict[Path, Any] = {}
         self._quality_cache: dict[Path, tuple[float, int]] = {}
+        self._metadata_cache: dict[Path, TrackInfo] = {}
         # Stores: list of dicts: {"fp": (duration, fp_bits), "quality": score, "bitrate": br, "target": Path, "sha256": str, "source": Path}
         self._acoustic_registry: list[dict[str, Any]] = []
 
@@ -428,15 +436,143 @@ class FusionEngine:
                     )
                 )
 
+    def _extract_normalized_metadata(
+        self,
+        source: Path,
+        source_root: Path,
+    ) -> TrackInfo:
+        """Extract tags from audio file, completing missing fields from folder/filename clues."""
+        meta = read_metadata(source) if self._is_audio(source) else None
+        if meta is not None:
+            info = TrackInfo(**{k: getattr(meta, k) for k in meta.__dataclass_fields__})
+        else:
+            info = TrackInfo()
+
+        try:
+            rel = source.relative_to(source_root)
+            parts = rel.parts
+        except ValueError:
+            parts = (source.name,)
+
+        # Extract folder clues
+        artist_folder = None
+        album_folder = None
+        if len(parts) >= 3:
+            artist_folder = parts[-3]
+            album_folder = parts[-2]
+        elif len(parts) == 2:
+            first = parts[-2]
+            if re.match(r"^[\(\[]?\d{4}[\)\]]?\s*[-_]", first):
+                album_folder = first
+            else:
+                artist_folder = first
+
+        # Parse album folder clue for year & album name
+        year_clue = None
+        album_clue = None
+        if album_folder:
+            m_alb = re.match(r"^[\(\[]?(\d{4})[\)\]]?\s*[-_.\s]\s*(.+)$", album_folder)
+            if m_alb:
+                year_clue = int(m_alb.group(1))
+                album_clue = m_alb.group(2).strip()
+            else:
+                album_clue = album_folder.strip()
+
+        # Parse filename clue for track number & title
+        stem = source.stem
+        m_trk = re.match(r"^(?:(?:track|pista)\s*)?(\d{1,3})\s*[-._\s]\s*(.+)$", stem, re.IGNORECASE)
+        if m_trk:
+            track_clue = int(m_trk.group(1))
+            title_clue = m_trk.group(2).strip()
+        else:
+            track_clue = None
+            title_clue = stem.strip()
+
+        # Reconcile artist
+        artist = (info.artist or info.album_artist or "").strip()
+        if not artist and artist_folder:
+            artist = artist_folder.strip()
+        if not artist:
+            artist = "Artista Desconocido"
+        self.register_canonical_name(artist)
+        artist = self.get_canonical_name(artist)
+        info.artist = artist
+        if not info.album_artist:
+            info.album_artist = artist
+
+        # Reconcile year
+        if info.year is None and year_clue is not None:
+            info.year = year_clue
+
+        # Reconcile album
+        album = (info.album or "").strip()
+        if not album and album_clue:
+            album = album_clue.strip()
+        if not album:
+            album = "Álbum Desconocido"
+        self.register_canonical_name(album)
+        album = self.get_canonical_name(album)
+        info.album = album
+
+        # Reconcile track_no
+        if info.track_no is None and track_clue is not None:
+            info.track_no = track_clue
+
+        # Reconcile title
+        title = (info.title or "").strip()
+        if not title and title_clue:
+            title = title_clue.strip()
+        if not title:
+            title = stem.strip()
+        info.title = title
+
+        return info
+
     def _resolve_target_path(
         self,
         source: Path,
         source_root: Path,
         sha256: str,
     ) -> tuple[Path, bool]:
-        """Determine destination path, collapsing folder variants (Babasonicos -> Babasónicos)."""
+        """Determine destination path with optional normalization (Artista/Año - Álbum/00 - Título.ext)."""
         dest = self.options.destination
-        if self.options.preserve_structure:
+        if self.options.normalize_structure:
+            info = self._extract_normalized_metadata(source, source_root)
+            self._metadata_cache[source.resolve()] = info
+
+            def _clean(val: str) -> str:
+                c = re.sub(r'[/\\:*?"<>|]', '-', val)
+                c = re.sub(r'\s+', ' ', c).strip('. ')
+                return c or "unknown"
+
+            artist_dir = _clean(info.artist or "Artista Desconocido")
+
+            album_str = info.album or "Álbum Desconocido"
+            m_pre = re.match(r"^[\(\[]?(\d{4})[\)\]]?\s*[-_.\s]\s*(.+)$", album_str)
+            if m_pre:
+                if not info.year:
+                    info.year = int(m_pre.group(1))
+                clean_album = m_pre.group(2).strip()
+            else:
+                clean_album = album_str.strip()
+
+            if info.year:
+                album_dir = _clean(f"{info.year} - {clean_album}")
+            else:
+                album_dir = _clean(clean_album)
+
+            if not self._is_audio(source):
+                file_name = self.get_canonical_name(source.name)
+            else:
+                ext = source.suffix
+                title = info.title or source.stem
+                if info.track_no is not None:
+                    file_name = _clean(f"{info.track_no:02d} - {title}") + ext
+                else:
+                    file_name = _clean(title) + ext
+
+            initial_target = dest / artist_dir / album_dir / file_name
+        elif self.options.preserve_structure:
             try:
                 rel = source.relative_to(source_root)
                 canon_dirs = [self.get_canonical_name(part) for part in rel.parts[:-1]]
@@ -883,6 +1019,20 @@ class FusionEngine:
                 verified = True
 
             os.replace(temp_target, target)
+
+            # Update tags in destination file if requested
+            if self.options.update_tags and self._is_audio(target):
+                info = self._metadata_cache.get(source.resolve())
+                if info is not None:
+                    try:
+                        errs = write_metadata_tags(target, info)
+                        if not errs:
+                            new_sha = hash_file(target, algorithm="sha256")
+                            if new_sha:
+                                self._hash_cache[target.resolve()] = new_sha
+                                self._destination_hashes[new_sha] = target
+                    except Exception as err:
+                        logger.warning("No se pudieron escribir tags en %s: %s", target, err)
 
             report.copied_items.append(
                 CopiedItem(

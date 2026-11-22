@@ -239,6 +239,11 @@ class FusionPage(QWidget):
         self.chk_acoustic.setToolTip("Compara la huella sonora real de la música (Chromaprint/AcoustID) y, si dos temas son la misma canción pero con distinta compresión, conserva automáticamente la copia con mayor bitrate.")
         opts_grid.addWidget(self.chk_acoustic, 2, 1)
 
+        self.chk_normalize = QCheckBox("🏷️ Normalizar nombres y tags (Artista / Año - Álbum / 00 - Título.ext)")
+        self.chk_normalize.setChecked(True)
+        self.chk_normalize.setToolTip("Organiza el destino en 'Artista/Año - Álbum/00 - Título.ext', completando y actualizando las etiquetas de audio sin alterar los archivos de origen.")
+        opts_grid.addWidget(self.chk_normalize, 3, 0, 1, 2)
+
         right_box.addLayout(opts_grid)
         dirs_layout.addWidget(right_frame, 1)
         layout.addLayout(dirs_layout)
@@ -448,6 +453,8 @@ class FusionPage(QWidget):
             include_subdirectories=self.chk_subdirs.isChecked(),
             verify_sha256=self.chk_verify.isChecked(),
             preserve_structure=self.chk_preserve_structure.isChecked(),
+            normalize_structure=self.chk_normalize.isChecked(),
+            update_tags=self.chk_normalize.isChecked(),
             acoustic_detection=self.chk_acoustic.isChecked(),
         )
 
