@@ -17,6 +17,7 @@ import os
 import re
 import shutil
 import time
+from collections import defaultdict
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -90,6 +91,7 @@ class FusionOptions:
     acoustic_detection: bool = True
     acoustic_threshold: float = 0.85
     supported_extensions: set[str] | None = None  # None means MEDIA_EXTENSIONS
+    online_lookup: bool = True
 
 
 @dataclass
@@ -278,6 +280,10 @@ class FusionEngine:
         # Stores: list of dicts: {"fp": (duration, fp_bits), "quality": score, "bitrate": br, "target": Path, "sha256": str, "source": Path}
         self._acoustic_registry: list[dict[str, Any]] = []
         self._max_workers = min(16, os.cpu_count() or 4)
+        self._album_folder_cache: dict[tuple[str, str], str] = {}
+        self._online_year_cache: dict[tuple[str, str], int | None] = {}
+        self._album_clues: dict[tuple[str, str], dict[str, Any]] = {}
+        self._destination_audio_dirs: set[Path] = set()
 
     def cancel(self) -> None:
         """Signal cooperative cancellation."""
@@ -499,6 +505,9 @@ class FusionEngine:
                 self._destination_hashes[h] = file_path
                 self._allocated_targets.add(file_path.resolve())
 
+                if self._is_audio(file_path):
+                    self._destination_audio_dirs.add(file_path.parent.resolve())
+
                 # If acoustic detection is enabled, index existing acoustic fingerprints
                 if self.options.acoustic_detection and self._is_audio(file_path):
                     fp = self.compute_fingerprint(file_path)
@@ -528,6 +537,241 @@ class FusionEngine:
                         current_file=file_path.name,
                     )
                 )
+
+        self._consolidate_destination_albums(on_progress=on_progress)
+        self._cleanup_orphaned_sidecar_folders()
+
+    def _lookup_album_year_online(self, artist: str, album: str) -> int | None:
+        """Query MusicBrainz or Wikipedia to find the official release year for artist & album."""
+        key = (_canonical_key(artist), _canonical_key(album))
+        if key in self._online_year_cache:
+            return self._online_year_cache[key]
+
+        year: int | None = None
+
+        # 1. Try MusicBrainz
+        try:
+            from musicfusion.services.musicbrainz import MusicBrainzClient
+            mb = MusicBrainzClient(
+                user_agent="MusicFusionPro/1.0 (https://github.com/juanmanuelubilla/MusicOrder)",
+                timeout=3,
+                retries=1,
+                min_interval=0.2,
+            )
+            results = mb.search_releasegroup(artist=artist, album=album, limit=3)
+            if results:
+                for rg in results:
+                    if rg.year and rg.score >= 60:
+                        year = rg.year
+                        break
+        except Exception as exc:
+            logger.debug("MusicBrainz lookup failed for %s - %s: %s", artist, album, exc)
+
+        # 2. If MusicBrainz did not return a year, try Wikipedia
+        if year is None:
+            try:
+                from musicfusion.services.wikipedia import WikipediaClient
+                from musicfusion.matching.normalize import normalize_music_text
+                w = WikipediaClient(timeout=4)
+                summary_data = w.album_summary(artist, album)
+                if summary_data and summary_data.get("summary"):
+                    text = summary_data["summary"]
+                    norm_artist = normalize_music_text(artist)
+                    for line in text.splitlines():
+                        if norm_artist in normalize_music_text(line):
+                            m = re.search(r'\b(19\d{2}|20\d{2})\b', line)
+                            if m:
+                                year = int(m.group(1))
+                                break
+                    if year is None:
+                        m_gen = re.search(r'(?:lanzado|publicado|publicación|grabado|año|de)\s+(?:en\s+|el\s+)?\b(19\d{2}|20\d{2})\b', text, re.IGNORECASE)
+                        if m_gen:
+                            year = int(m_gen.group(1))
+            except Exception as exc:
+                logger.debug("Wikipedia lookup failed for %s - %s: %s", artist, album, exc)
+
+        self._online_year_cache[key] = year
+        if year:
+            logger.info("Año oficial detectado online para %s - %s: %d", artist, album, year)
+        return year
+
+    def _resolve_album_folder(
+        self,
+        artist: str,
+        album: str,
+        track_year: int | None = None,
+        folder_year_clue: int | None = None,
+    ) -> str:
+        """Resolve a unified album folder (e.g. '2002 - Obras Cumbres') for all tracks of an album."""
+        def _clean(val: str) -> str:
+            c = re.sub(r'[/\\:*?"<>|]', '-', val)
+            c = re.sub(r'\s+', ' ', c).strip('. ')
+            return c or "unknown"
+
+        key = (_canonical_key(artist), _canonical_key(album))
+        if key in self._album_folder_cache:
+            return self._album_folder_cache[key]
+
+        canonical_album = self.get_canonical_name(album)
+        clean_album = _clean(canonical_album)
+
+        # 1. Try online lookup
+        online_year = None
+        if self.options.online_lookup:
+            online_year = self._lookup_album_year_online(artist, canonical_album)
+
+        canonical_year = online_year
+
+        # 2. Check destination if online year not found
+        if canonical_year is None:
+            dest_artist_dir = self.options.destination / _clean(artist)
+            if dest_artist_dir.is_dir():
+                try:
+                    for sub in dest_artist_dir.iterdir():
+                        if sub.is_dir():
+                            m = re.match(r"^[\(\[]?(\d{4})[\)\]]?\s*[-_.\s]\s*(.+)$", sub.name)
+                            if m:
+                                sub_year = int(m.group(1))
+                                sub_album = m.group(2).strip()
+                                if _canonical_key(sub_album) == _canonical_key(album):
+                                    canonical_year = sub_year
+                                    break
+                except OSError:
+                    pass
+
+        # 3. Check pre-collected clues from source candidate folders or tracks
+        if canonical_year is None:
+            clues = self._album_clues.get(key, {})
+            folder_years = clues.get("folder_years", set())
+            track_years = clues.get("track_years", [])
+            if folder_years:
+                canonical_year = min(folder_years)
+            elif folder_year_clue:
+                canonical_year = folder_year_clue
+            elif track_years:
+                from collections import Counter
+                counts = Counter(track_years)
+                canonical_year = counts.most_common(1)[0][0]
+            elif track_year:
+                canonical_year = track_year
+
+        if canonical_year:
+            album_dir = _clean(f"{canonical_year} - {clean_album}")
+        else:
+            album_dir = _clean(clean_album)
+
+        self._album_folder_cache[key] = album_dir
+        return album_dir
+
+    def _consolidate_destination_albums(self, on_progress: ProgressCallback | None = None) -> None:
+        """Merge fragmented album folders in destination (e.g. multiple 'YYYY - Obras Cumbres') into a unified album folder."""
+        if self.options.preserve_structure or not self.options.normalize_structure:
+            return
+        dest = self.options.destination
+        if not dest.is_dir():
+            return
+
+        try:
+            artist_entries = [p for p in dest.iterdir() if p.is_dir()]
+        except OSError:
+            return
+
+        for artist_dir in artist_entries:
+            if artist_dir.name in {".git", "_REVISION", "lost+found"}:
+                continue
+            try:
+                subdirs = [p for p in artist_dir.iterdir() if p.is_dir()]
+            except OSError:
+                continue
+
+            album_groups: dict[str, list[tuple[Path, int | None, str]]] = defaultdict(list)
+            for sub in subdirs:
+                m = re.match(r"^[\(\[]?(\d{4})[\)\]]?\s*[-_.\s]\s*(.+)$", sub.name)
+                if m:
+                    year = int(m.group(1))
+                    clean_name = m.group(2).strip()
+                else:
+                    year = None
+                    clean_name = sub.name.strip()
+                album_groups[_canonical_key(clean_name)].append((sub, year, clean_name))
+
+            for key_album, items in album_groups.items():
+                if len(items) <= 1:
+                    continue
+                # MULTIPLE FOLDERS FOR SAME ALBUM!
+                clean_name = self.get_canonical_name(items[0][2])
+                unified_folder_name = self._resolve_album_folder(
+                    artist=artist_dir.name,
+                    album=clean_name,
+                )
+                unified_dir = artist_dir / unified_folder_name
+                if not self.options.simulation:
+                    unified_dir.mkdir(parents=True, exist_ok=True)
+
+                logger.info("Consolidando carpetas de álbum en destino: %s -> %s", [it[0].name for it in items], unified_dir.name)
+
+                for old_dir, _, _ in items:
+                    if old_dir.resolve() == unified_dir.resolve():
+                        continue
+                    if self.options.simulation:
+                        continue
+                    try:
+                        for item in list(old_dir.iterdir()):
+                            if not item.is_file():
+                                continue
+                            target_file = unified_dir / item.name
+                            if not target_file.exists():
+                                shutil.move(str(item), str(target_file))
+                                old_sha = self.compute_sha256(target_file)
+                                if old_sha:
+                                    self._destination_hashes[old_sha] = target_file
+                            else:
+                                if self.compute_sha256(item) == self.compute_sha256(target_file):
+                                    item.unlink()
+                                else:
+                                    renamed = unique_path(unified_dir, item.name)
+                                    shutil.move(str(item), str(renamed))
+                                    old_sha = self.compute_sha256(renamed)
+                                    if old_sha:
+                                        self._destination_hashes[old_sha] = renamed
+                    except OSError as exc:
+                        logger.warning("Error moviendo archivos de %s a %s: %s", old_dir, unified_dir, exc)
+
+                    try:
+                        old_dir.rmdir()
+                    except OSError:
+                        pass
+
+    def _cleanup_orphaned_sidecar_folders(self) -> None:
+        """Remove any directories in destination that contain only sidecars/images and 0 audio files."""
+        if self.options.simulation:
+            return
+        dest = self.options.destination
+        if not dest.is_dir():
+            return
+
+        for root_dir, dirs, files in os.walk(dest, topdown=False):
+            p_root = Path(root_dir)
+            if p_root.resolve() == dest.resolve():
+                continue
+
+            has_audio = False
+            for sub_root, _, sub_files in os.walk(p_root):
+                if any(self._is_audio(Path(f)) for f in sub_files):
+                    has_audio = True
+                    break
+
+            if not has_audio:
+                for f in files:
+                    try:
+                        (p_root / f).unlink()
+                    except OSError:
+                        pass
+                try:
+                    p_root.rmdir()
+                    logger.info("Eliminada carpeta sin pistas de audio: %s", p_root)
+                except OSError:
+                    pass
 
     def _extract_normalized_metadata(
         self,
@@ -581,12 +825,27 @@ class FusionEngine:
             track_clue = None
             title_clue = stem.strip()
 
-        # Reconcile artist
-        artist = (info.artist or info.album_artist or "").strip()
-        if not artist and artist_folder:
-            artist = artist_folder.strip()
+        # Reconcile artist: prioritize album_artist for album-level grouping
+        artist = (info.album_artist or "").strip()
         if not artist:
-            artist = "Artista Desconocido"
+            track_artist = (info.artist or "").strip()
+            if artist_folder and track_artist.startswith(artist_folder):
+                artist = artist_folder.strip()
+            elif track_artist:
+                # Check for collaborations / remixes: "Babasónicos; Daniel Melero"
+                parts = re.split(r'\s*(?:;|/|\bfeat\.?\b|\bft\.?\b|\bvs\.?\b)\s*', track_artist, flags=re.IGNORECASE)
+                if len(parts) > 1 and parts[0].strip():
+                    if artist_folder and _canonical_key(parts[0]) == _canonical_key(artist_folder):
+                        artist = artist_folder.strip()
+                    else:
+                        artist = parts[0].strip()
+                else:
+                    artist = track_artist
+            elif artist_folder:
+                artist = artist_folder.strip()
+            else:
+                artist = "Artista Desconocido"
+
         self.register_canonical_name(artist)
         artist = self.get_canonical_name(artist)
         info.artist = artist
@@ -606,6 +865,15 @@ class FusionEngine:
         self.register_canonical_name(album)
         album = self.get_canonical_name(album)
         info.album = album
+
+        # Record clues for this album
+        album_key = (_canonical_key(artist), _canonical_key(album))
+        if album_key not in self._album_clues:
+            self._album_clues[album_key] = {"folder_years": set(), "track_years": []}
+        if year_clue is not None:
+            self._album_clues[album_key]["folder_years"].add(year_clue)
+        if info.year is not None:
+            self._album_clues[album_key]["track_years"].append(info.year)
 
         # Reconcile track_no
         if info.track_no is None and track_clue is not None:
@@ -649,10 +917,14 @@ class FusionEngine:
             else:
                 clean_album = album_str.strip()
 
-            if info.year:
-                album_dir = _clean(f"{info.year} - {clean_album}")
-            else:
-                album_dir = _clean(clean_album)
+            self.register_canonical_name(clean_album)
+            clean_album = self.get_canonical_name(clean_album)
+
+            album_dir = self._resolve_album_folder(
+                artist=artist_dir,
+                album=clean_album,
+                track_year=info.year,
+            )
 
             if not self._is_audio(source):
                 file_name = self.get_canonical_name(source.name)
@@ -806,6 +1078,11 @@ class FusionEngine:
         prefetch_window = max(self._max_workers * 2, 16)
         active_futures: dict[Path, Any] = {}
 
+        # Sort candidates: process all audio files first so destination album folders receive audio before sidecars
+        audio_candidates = [c for c in all_candidates if self._is_audio(c[0])]
+        sidecar_candidates = [c for c in all_candidates if not self._is_audio(c[0])]
+        sorted_candidates = audio_candidates + sidecar_candidates
+
         def _prefetch_task(fp: Path) -> tuple[Any | None, tuple[float, int]]:
             fingerprint = None
             try:
@@ -850,7 +1127,7 @@ class FusionEngine:
                     )
                 )
 
-        for idx, (source_file, source_root) in enumerate(all_candidates, start=1):
+        for idx, (source_file, source_root) in enumerate(sorted_candidates, start=1):
             if self._cancel_requested:
                 if on_progress:
                     on_progress(
@@ -895,7 +1172,7 @@ class FusionEngine:
             # Maintain lookahead prefetch window across CPU threads
             if self.options.acoustic_detection:
                 for lookahead_idx in range(idx - 1, min(total_files, idx - 1 + prefetch_window)):
-                    cand_file, _ = all_candidates[lookahead_idx]
+                    cand_file, _ = sorted_candidates[lookahead_idx]
                     cand_res = cand_file.resolve()
                     if self._is_audio(cand_file) and cand_res not in active_futures and cand_res not in self._fp_cache:
                         active_futures[cand_res] = prefetch_executor.submit(_prefetch_task, cand_file)
@@ -904,6 +1181,32 @@ class FusionEngine:
             source_q_score, source_bitrate = (0.0, 0)
             source_fp = None
             is_audio_file = self._is_audio(source_file)
+
+            # If not an audio file (e.g. cover.jpg sidecar): verify destination folder has audio files
+            if not is_audio_file:
+                tentative_target, _ = self._resolve_target_path(source_file, source_root, sha256)
+                tentative_parent = tentative_target.parent.resolve()
+                has_audio_files = tentative_parent in self._destination_audio_dirs
+                if not has_audio_files and tentative_parent.is_dir():
+                    has_audio_files = any(self._is_audio(p) for p in tentative_parent.iterdir() if p.is_file())
+                    if has_audio_files:
+                        self._destination_audio_dirs.add(tentative_parent)
+
+                if not has_audio_files:
+                    # Do not copy sidecars into empty folders with no audio tracks!
+                    report.duplicates_detected += 1
+                    report.duplicate_items.append(
+                        DuplicateItem(
+                            source=source_file,
+                            matched_target=tentative_target,
+                            sha256=sha256,
+                            size=file_size,
+                            reason="omitido: carpeta destino sin pistas de audio",
+                            bitrate_kbps=0,
+                        )
+                    )
+                    _notify(idx, source_file.name, f"⏭️ Omitido cover/imagen (sin audio en destino): {source_file.name}")
+                    continue
 
             if is_audio_file and self.options.acoustic_detection:
                 source_res = source_file.resolve()
@@ -994,6 +1297,7 @@ class FusionEngine:
                             acoustic_match["source"] = source_file
                             acoustic_match["is_preexisting"] = False
                             self._destination_hashes[sha256] = new_target
+                            self._destination_audio_dirs.add(new_target.parent.resolve())
                             report.duplicates_detected += 1
                             if is_pre:
                                 report.files_copied += 1
@@ -1050,6 +1354,8 @@ class FusionEngine:
                 self._destination_hashes[sha256] = target_path
                 report.files_copied += 1
                 report.total_bytes_copied += file_size
+                if is_audio_file:
+                    self._destination_audio_dirs.add(target_path.parent.resolve())
                 report.copied_items.append(
                     CopiedItem(
                         source=source_file,
@@ -1120,6 +1426,10 @@ class FusionEngine:
                 break
 
         prefetch_executor.shutdown(wait=False, cancel_futures=True)
+
+        # Consolidate fragmented albums and cleanup any orphaned sidecar folders
+        self._consolidate_destination_albums(on_progress=on_progress)
+        self._cleanup_orphaned_sidecar_folders()
 
         report.elapsed_seconds = time.monotonic() - start_time
         if on_progress:
@@ -1194,6 +1504,9 @@ class FusionEngine:
                 verified = True
 
             os.replace(temp_target, target)
+
+            if self._is_audio(target):
+                self._destination_audio_dirs.add(target.parent.resolve())
 
             # Update tags in destination file if requested
             if self.options.update_tags and self._is_audio(target):

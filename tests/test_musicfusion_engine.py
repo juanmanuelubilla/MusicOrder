@@ -539,3 +539,107 @@ def test_normalize_structure_and_tag_updating(tmp_path: Path) -> None:
     assert meta.title == "Intro"
 
 
+def test_cover_only_folder_is_not_copied(tmp_path: Path) -> None:
+    """When a source folder only contains cover.jpg and no audio files, it must NOT be copied."""
+    src = tmp_path / "source"
+    dest = tmp_path / "dest"
+
+    # Album 1 has audio and cover
+    album1 = src / "BABASÓNICOS" / "1992 - Pasto"
+    _create_audio_file(album1 / "01 - Intro.mp3", b"AUDIO1")
+    cover1 = album1 / "cover.jpg"
+    cover1.write_bytes(b"COVER1")
+
+    # Album 2 has ONLY cover.jpg (no audio files)
+    album2 = src / "BABASÓNICOS" / "2001 - 40 Principales Pop & Rock Nacionales"
+    album2.mkdir(parents=True)
+    cover2 = album2 / "cover.jpg"
+    cover2.write_bytes(b"COVER2")
+
+    engine = FusionEngine(
+        FusionOptions(
+            sources=[src],
+            destination=dest,
+            normalize_structure=True,
+            online_lookup=False,
+        )
+    )
+    report = engine.run()
+
+    # Destination should have Album 1 with audio and cover
+    dest_album1 = dest / "BABASÓNICOS" / "1992 - Pasto"
+    assert dest_album1.exists()
+    assert (dest_album1 / "01 - Intro.mp3").exists()
+    assert (dest_album1 / "cover.jpg").exists()
+
+    # Destination MUST NOT have Album 2 because it only had cover.jpg
+    dest_album2 = dest / "BABASÓNICOS" / "2001 - 40 Principales Pop & Rock Nacionales"
+    assert not dest_album2.exists(), "Folder with only cover.jpg should not have been created"
+
+
+def test_obras_cumbres_multi_year_unification(tmp_path: Path) -> None:
+    """Tracks for the same album having different years (e.g. Obras Cumbres) must all be unified into ONE album folder."""
+    src = tmp_path / "source"
+    dest = tmp_path / "dest"
+
+    # Tracks spread across different source folders with different years
+    t1 = src / "BABASÓNICOS" / "1992 - Obras Cumbres" / "05 - Fiebre roller.mp3"
+    t2 = src / "BABASÓNICOS" / "1994 - Obras Cumbres" / "06 - Patinador sagrado.mp3"
+    t3 = src / "BABASÓNICOS" / "1997 - Obras Cumbres" / "09 - El adversario.mp3"
+    t4 = src / "BABASÓNICOS" / "2018 - Obras Cumbres" / "02 - Viva satana.mp3"
+    _create_audio_file(t1, b"AUDIO_OBRAS_1")
+    _create_audio_file(t2, b"AUDIO_OBRAS_2")
+    _create_audio_file(t3, b"AUDIO_OBRAS_3")
+    _create_audio_file(t4, b"AUDIO_OBRAS_4")
+
+    # Add a cover in one of them
+    cover = src / "BABASÓNICOS" / "2018 - Obras Cumbres" / "cover.jpg"
+    cover.write_bytes(b"COVER_OBRAS")
+
+    engine = FusionEngine(
+        FusionOptions(
+            sources=[src],
+            destination=dest,
+            normalize_structure=True,
+            online_lookup=False,  # Test offline unification
+        )
+    )
+    report = engine.run()
+
+    dest_artist = dest / "BABASÓNICOS"
+    assert dest_artist.exists()
+
+    # There should only be ONE "Obras Cumbres" album folder, not 4!
+    obras_folders = [p for p in dest_artist.iterdir() if p.is_dir() and "Obras Cumbres" in p.name]
+    assert len(obras_folders) == 1, f"Expected 1 unified folder for Obras Cumbres, got {len(obras_folders)}: {obras_folders}"
+
+    unified_folder = obras_folders[0]
+    mp3_files = list(unified_folder.glob("*.mp3"))
+    assert len(mp3_files) == 4, f"All 4 tracks must be in the unified folder, found: {mp3_files}"
+    assert (unified_folder / "cover.jpg").exists(), "Cover should be present in the unified folder"
+
+
+def test_collaboration_artist_not_split(tmp_path: Path) -> None:
+    """Collaboration tracks like 'BABASÓNICOS; DANIEL MELERO' inside BABASÓNICOS should stay in BABASÓNICOS."""
+    src = tmp_path / "source"
+    dest = tmp_path / "dest"
+
+    track = src / "BABASÓNICOS" / "2002 - Jessico Megamix" / "13 - Fizz (version).mp3"
+    _create_audio_file(track, b"AUDIO_FIZZ")
+
+    engine = FusionEngine(
+        FusionOptions(
+            sources=[src],
+            destination=dest,
+            normalize_structure=True,
+            online_lookup=False,
+        )
+    )
+    report = engine.run()
+
+    # Destination must have BABASÓNICOS, and NOT create BABASÓNICOS; DANIEL MELERO
+    assert (dest / "BABASÓNICOS").exists()
+    assert not (dest / "BABASÓNICOS; DANIEL MELERO").exists()
+
+
+
