@@ -368,22 +368,72 @@ class FusionEngine:
     def _is_audio(self, path: Path) -> bool:
         return path.suffix.lower() in AUDIO_EXTENSIONS
 
-    def _discover_files(self, root: Path, include_subdirs: bool) -> list[Path]:
-        """Scan directory for compatible files."""
+    def _discover_files(
+        self,
+        root: Path,
+        include_subdirs: bool,
+        on_progress: ProgressCallback | None = None,
+        exclude_dir: Path | None = None,
+    ) -> list[Path]:
+        """Scan directory for compatible files using os.walk with live progress and directory pruning."""
         if not root.is_dir():
             return []
         found: list[Path] = []
+        exclude_resolved = exclude_dir.resolve() if exclude_dir and exclude_dir.exists() else None
+        ignored_names = {
+            ".git", ".trash", ".trash-1000", "$recycle.bin", "system volume information",
+            "lost+found", ".cache", "node_modules", ".venv", "venv", "__pycache__",
+        }
+
+        last_notify = time.monotonic()
         try:
             if include_subdirs:
-                for entry in root.rglob("*"):
-                    if entry.is_file() and self._is_compatible(entry):
-                        found.append(entry)
+                for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+                    if self._cancel_requested:
+                        break
+                    try:
+                        dir_path = Path(dirpath).resolve()
+                    except OSError:
+                        continue
+
+                    # Prune destination directory if located inside the source
+                    if exclude_resolved and (dir_path == exclude_resolved or exclude_resolved in dir_path.parents):
+                        dirnames.clear()
+                        continue
+
+                    # Prune system/hidden directories
+                    dirnames[:] = [d for d in dirnames if d.lower() not in ignored_names and not d.startswith(".")]
+
+                    for fn in filenames:
+                        if fn.startswith("."):
+                            continue
+                        fp = Path(dirpath) / fn
+                        if self._is_compatible(fp):
+                            found.append(fp)
+                            now = time.monotonic()
+                            if on_progress and (len(found) % 25 == 0 or now - last_notify >= 0.25):
+                                last_notify = now
+                                on_progress(
+                                    ProgressData(
+                                        stage="scanning",
+                                        files_found=len(found),
+                                        status_message=f"Buscando música en {root.name}: {len(found)} archivos encontrados…",
+                                        current_file=f"Escaneando: {fn}",
+                                    )
+                                )
             else:
-                for entry in root.glob("*"):
-                    if entry.is_file() and self._is_compatible(entry):
-                        found.append(entry)
+                try:
+                    with os.scandir(root) as it:
+                        for entry in it:
+                            if entry.is_file() and not entry.name.startswith("."):
+                                p = Path(entry.path)
+                                if self._is_compatible(p):
+                                    found.append(p)
+                except OSError:
+                    pass
         except OSError as exc:
             logger.warning("Error traversing directory %s: %s", root, exc)
+
         return found
 
     def _index_destination(self, on_progress: ProgressCallback | None = None) -> None:
@@ -392,7 +442,7 @@ class FusionEngine:
         if not dest.exists():
             return
 
-        dest_files = self._discover_files(dest, include_subdirs=True)
+        dest_files = self._discover_files(dest, include_subdirs=True, on_progress=on_progress)
         total = len(dest_files)
         for idx, file_path in enumerate(dest_files, start=1):
             if self._cancel_requested:
@@ -426,13 +476,16 @@ class FusionEngine:
                             }
                         )
 
-            if on_progress and (idx % 25 == 0 or idx == total):
+            if on_progress and (idx % 10 == 0 or idx == total or total < 50):
+                pct = (idx / total) * 100.0 if total > 0 else 0.0
                 on_progress(
                     ProgressData(
                         stage="indexing_destination",
                         files_found=total,
                         files_analyzed=idx,
-                        status_message=f"Indexando destino: {file_path.name}…",
+                        percent=pct,
+                        status_message=f"Indexando destino ({idx}/{total}): {file_path.name}",
+                        current_file=file_path.name,
                     )
                 )
 
@@ -659,7 +712,20 @@ class FusionEngine:
                     ErrorItem(source=src, target=None, error_message="Directorio de origen no existe")
                 )
                 continue
-            files = self._discover_files(src, self.options.include_subdirectories)
+            if on_progress:
+                on_progress(
+                    ProgressData(
+                        stage="scanning",
+                        status_message=f"Buscando música en: {src}…",
+                        current_file=f"Escaneando {src.name}",
+                    )
+                )
+            files = self._discover_files(
+                src,
+                self.options.include_subdirectories,
+                on_progress=on_progress,
+                exclude_dir=self.options.destination,
+            )
             for f in files:
                 all_candidates.append((f, src))
                 try:
@@ -689,6 +755,35 @@ class FusionEngine:
         bytes_copied_so_far = 0
         last_progress_time = time.monotonic()
 
+        def _notify(current_idx: int, current_name: str, msg: str) -> None:
+            nonlocal last_progress_time
+            now = time.monotonic()
+            elapsed = now - start_time
+            if on_progress and (now - last_progress_time >= 0.05 or total_files < 50 or current_idx == total_files):
+                last_progress_time = now
+                speed_files = current_idx / elapsed if elapsed > 0 else 0.0
+                speed_bytes = bytes_copied_so_far / elapsed if elapsed > 0 else 0.0
+                percent = (current_idx / total_files) * 100.0
+
+                on_progress(
+                    ProgressData(
+                        stage="processing",
+                        files_found=total_files,
+                        files_analyzed=current_idx,
+                        files_copied=report.files_copied,
+                        duplicates_omitted=report.duplicates_detected,
+                        conflicts_resolved=report.conflicts_resolved,
+                        quality_upgrades=report.quality_upgrades,
+                        errors=report.errors_count,
+                        percent=percent,
+                        speed_files_sec=speed_files,
+                        speed_bytes_sec=speed_bytes,
+                        elapsed_seconds=elapsed,
+                        current_file=current_name,
+                        status_message=msg,
+                    )
+                )
+
         for idx, (source_file, source_root) in enumerate(all_candidates, start=1):
             if self._cancel_requested:
                 if on_progress:
@@ -714,6 +809,7 @@ class FusionEngine:
                 report.error_items.append(
                     ErrorItem(source=source_file, target=None, error_message=f"Error leyendo archivo: {exc}")
                 )
+                _notify(idx, source_file.name, f"❌ Error leyendo archivo: {source_file.name}")
                 continue
 
             # Calculate SHA-256
@@ -727,6 +823,7 @@ class FusionEngine:
                         error_message="No se pudo calcular el hash SHA-256",
                     )
                 )
+                _notify(idx, source_file.name, f"❌ Error calculando SHA-256: {source_file.name}")
                 continue
 
             # Compute quality/bitrate for audio
@@ -750,6 +847,7 @@ class FusionEngine:
                         bitrate_kbps=source_bitrate,
                     )
                 )
+                _notify(idx, source_file.name, f"⏭️ Omitido duplicado (SHA-256): {source_file.name}")
                 continue
 
             # Check Level 2: Acoustic Fingerprint Duplicate (different compression / bitrate / tags)
@@ -829,6 +927,7 @@ class FusionEngine:
                             report.files_copied += 1
                             report.unique_files += 1
                             acoustic_match["is_preexisting"] = False
+                    _notify(idx, source_file.name, f"⭐ Calidad mejorada: {source_file.name} ({source_bitrate} kbps)")
                 else:
                     # EXISTING TARGET HAS BETTER OR EQUAL BITRATE -> Omit new source as lower-quality duplicate
                     report.duplicates_detected += 1
@@ -847,6 +946,7 @@ class FusionEngine:
                             bitrate_kbps=source_bitrate,
                         )
                     )
+                    _notify(idx, source_file.name, f"⏭️ Omitido duplicado acústico: {source_file.name}")
                 continue
 
             # Level 3: Unique file -> Plan and copy
@@ -913,33 +1013,7 @@ class FusionEngine:
                             }
                         )
 
-            # Emit progress
-            now = time.monotonic()
-            elapsed = now - start_time
-            if on_progress and (now - last_progress_time >= 0.05 or total_files < 50 or idx == total_files):
-                last_progress_time = now
-                speed_files = idx / elapsed if elapsed > 0 else 0.0
-                speed_bytes = bytes_copied_so_far / elapsed if elapsed > 0 else 0.0
-                percent = (idx / total_files) * 100.0
-
-                on_progress(
-                    ProgressData(
-                        stage="processing",
-                        files_found=total_files,
-                        files_analyzed=idx,
-                        files_copied=report.files_copied,
-                        duplicates_omitted=report.duplicates_detected,
-                        conflicts_resolved=report.conflicts_resolved,
-                        quality_upgrades=report.quality_upgrades,
-                        errors=report.errors_count,
-                        percent=percent,
-                        speed_files_sec=speed_files,
-                        speed_bytes_sec=speed_bytes,
-                        elapsed_seconds=elapsed,
-                        current_file=source_file.name,
-                        status_message=f"Procesando: {source_file.name}",
-                    )
-                )
+            _notify(idx, source_file.name, f"⚡ Copiando [{source_bitrate} kbps]: {source_file.name}")
 
             if self._cancel_requested:
                 if on_progress:

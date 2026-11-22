@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import time
 from typing import Any
 
 from PySide6.QtCore import QObject, QThread, Qt, Signal
@@ -81,6 +82,8 @@ class FusionPage(QWidget):
         self.destination: Path | None = None
         self._worker: FusionWorker | None = None
         self._last_report: FusionReport | None = None
+        self._last_logged_msg: str = ""
+        self._last_log_time: float = 0.0
 
         main_layout = QVBoxLayout(self)
         main_layout.setSpacing(0)
@@ -437,6 +440,7 @@ class FusionPage(QWidget):
             )
             return
 
+        broad_roots = {Path("/"), Path("/mnt"), Path("/media"), Path("/Volumes")}
         for src in self.sources:
             if src == self.destination:
                 QMessageBox.warning(
@@ -445,6 +449,19 @@ class FusionPage(QWidget):
                     f"El destino no puede ser la misma carpeta de origen:\n{src}",
                 )
                 return
+            if src in broad_roots:
+                reply = QMessageBox.question(
+                    self,
+                    "Atención: Directorio de sistema seleccionado",
+                    f"Has seleccionado '{src}' como origen.\n\n"
+                    "Escanear una ruta raíz o de montaje puede demorar varios minutos porque "
+                    "incluye todos los discos montados.\n\n"
+                    "¿Deseas continuar de todas formas?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes,
+                )
+                if reply != QMessageBox.StandardButton.Yes:
+                    return
 
         opts = FusionOptions(
             sources=list(self.sources),
@@ -465,6 +482,8 @@ class FusionPage(QWidget):
         self.progress_bar.setValue(0)
         self.lbl_percent.setText("0%")
         self.console.clear()
+        self._last_logged_msg = ""
+        self._last_log_time = 0.0
 
         sim_str = " [MODO SIMULACIÓN - SIN COPIAR]" if opts.simulation else ""
         self.log(f"🚀 INICIANDO FUSIÓN DE BIBLIOTECAS{sim_str}")
@@ -472,6 +491,14 @@ class FusionPage(QWidget):
         for s in opts.sources:
             self.log(f"     • {s}")
         self.log(f"   Carpeta de destino: {opts.destination}")
+
+        for s in opts.sources:
+            try:
+                if self.destination.is_relative_to(s):
+                    self.log(f"   ℹ️ Nota: El destino está dentro de '{s}'. Se excluirá automáticamente del escaneo para evitar recursión.")
+            except AttributeError:
+                pass
+
         self.log("------------------------------------------------------------------")
 
         self._worker = FusionWorker(opts, self)
@@ -503,8 +530,15 @@ class FusionPage(QWidget):
         self.lbl_speed.setText(f"Velocidad: {data.speed_files_sec:.1f} arch/s ({speed_mb:.2f} MB/s)")
         self.lbl_time.setText(f"Tiempo: {data.elapsed_seconds:.1f} s")
 
-        if data.current_file:
-            self.log(f"[{data.percent:5.1f}%] {data.status_message}")
+        msg = data.status_message
+        now = time.time()
+        # Log to console if message changed and is a notable action OR if > 0.4s elapsed
+        is_action = any(sym in msg for sym in ("🔍", "📚", "⏭️", "⭐", "⚡", "❌", "⚠️", "Copiando", "Omitido", "Mejorada"))
+        if msg and (msg != self._last_logged_msg):
+            if is_action or (now - self._last_log_time >= 0.4):
+                self.log(f"[{data.percent:5.1f}%] {msg}")
+                self._last_logged_msg = msg
+                self._last_log_time = now
 
     def _on_finished(self, report: FusionReport) -> None:
         self._last_report = report
